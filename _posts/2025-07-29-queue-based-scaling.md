@@ -140,7 +140,7 @@ Hard concurrency limiting can be achieved by setting the `max_inflight` environm
 ```yaml
     environment:
         max_inflight: "10"
-``` 
+```
 
 [Retries](https://docs.openfaas.com/openfaas-pro/retries/) are already configured as a system-wide default from the Helm chart, but they can be overridden on a per function basis, which is important for long running jobs that may take a while to complete.
 
@@ -161,6 +161,9 @@ That meant that if you had 10,000 invocations come in from one tenant for their 
 The new mode creates a Consumer per function, where each Consumer gets scheduled independently into a work queue.
 
 If you do find that certain tenants, or functions are monopolising the queue, you can provision dedicated queues using the [Queue Worker Helm chart](https://github.com/openfaas/faas-netes/tree/master/chart/queue-worker).
+
+![Screenshot of queue selection dropdown on the Queue Worker Grafana dashboard](/images/2025-07-queue-based/queue-selection.png)
+> When running multiple dedicated queues, the Queue Worker Grafana Dashboard supports filtering and displaying metrics per queue.
 
 Let's picture the difference by observing the Grafana Dashboard for the Queue Worker.
 

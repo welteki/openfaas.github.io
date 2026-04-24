@@ -417,6 +417,157 @@ for line in result.log:
     print(line)
 ```
 
+## End-to-end example: source to URL in a custom namespace
+
+So far we've looked at each part of the SDK in isolation. This section brings everything together in a single script that goes from source code to a running, authenticated function — creating the namespace and secret along the way.
+
+The full source code for this example is available at [welteki/openfaas-python-sdk-example](https://github.com/welteki/openfaas-python-sdk-example).
+
+### The greeter function
+
+The function we'll build and deploy is a simple API key validator. It reads an API key from an OpenFaaS secret mounted at `/var/openfaas/secrets/api-key`, then checks every incoming request for an `Authorization: Bearer <token>` header. A matching token gets a `200` response; anything else gets a `401`.
+
+The function is initialised with `faas-cli` using the `python3-http` template:
+
+```bash
+faas-cli template store pull python3-http
+faas-cli new greeter --lang python3-http
+```
+
+The handler in `greeter/handler.py`:
+
+```python
+import json
+
+
+def handle(event, context):
+    secret_path = "/var/openfaas/secrets/api-key"
+    with open(secret_path) as f:
+        api_key = f.read().strip()
+
+    auth_header = event.headers.get("Authorization", "")
+    if not auth_header.startswith("Bearer "):
+        return {
+            "statusCode": 401,
+            "body": json.dumps({"error": "Unauthorized"}),
+            "headers": {"Content-Type": "application/json"},
+        }
+
+    token = auth_header[len("Bearer "):]
+    if token != api_key:
+        return {
+            "statusCode": 401,
+            "body": json.dumps({"error": "Unauthorized"}),
+            "headers": {"Content-Type": "application/json"},
+        }
+
+    return {
+        "statusCode": 200,
+        "body": json.dumps({"message": "Hello from OpenFaaS!"}),
+        "headers": {"Content-Type": "application/json"},
+    }
+```
+
+### Create the namespace and secret
+
+We create a `tenant1` namespace to isolate the function, then generate a random UUID as the API key and store it as an OpenFaaS secret in that namespace. API errors are raised as typed exceptions, so a single `try/except` block around the client session is enough to handle auth and connection failures in one place:
+
+```python
+import uuid
+from openfaas import BasicAuth, Client
+from openfaas.exceptions import APIConnectionError, ForbiddenError, UnauthorizedError
+from openfaas.models import FunctionNamespace, Secret
+
+try:
+    with Client(gateway_url="https://gateway.example.com", auth=BasicAuth("admin", password)) as client:
+
+        # Create a dedicated namespace for this tenant
+        client.create_namespace(
+            FunctionNamespace(
+                name="tenant1",
+                labels={"managed-by": "openfaas-python-sdk-example"},
+            )
+        )
+
+        # Generate an API key and store it as a secret
+        api_key = str(uuid.uuid4())
+        client.create_secret(Secret(name="api-key", namespace="tenant1", value=api_key))
+
+except UnauthorizedError:
+    print("Error: unauthorized. Check your credentials.")
+except ForbiddenError:
+    print("Error: insufficient permissions.")
+except APIConnectionError as e:
+    print(f"Error: could not reach the gateway: {e}")
+```
+
+The secret value is write-only — once created it is never returned by the API. Only the function that has it mounted can read it.
+
+### Build from source
+
+With the namespace and secret in place, we build the container image from source using the Function Builder. `create_build_context` assembles the Docker build context from the template and handler directory, `make_tar` packs it into a tar archive, and `build_stream` sends it to the builder and streams the log output line by line:
+
+```python
+from openfaas.builder import BuildConfig, FunctionBuilder, create_build_context, make_tar
+
+# Assemble the build context from the template and handler
+context_path = create_build_context(
+    function_name="greeter",
+    handler="./greeter",
+    language="python3-http",
+    template_dir="./template",
+    build_dir="./build",
+)
+
+# Pack the context into a tar with the build config
+config = BuildConfig(image="ttl.sh/greeter:1h", platforms=["linux/amd64"])
+make_tar("/tmp/greeter-build.tar", context_path, config)
+
+# Stream the build logs from the Function Builder
+with open("/var/secrets/payload-secret") as f:
+    hmac_secret = f.read().strip()
+
+builder = FunctionBuilder("https://builder.example.com", hmac_secret=hmac_secret)
+for result in builder.build_stream("/tmp/greeter-build.tar"):
+    for line in result.log:
+        print(line)
+    if result.status in ("success", "failed"):
+        print(f"Build {result.status}: {result.image}")
+```
+
+### Deploy into the namespace
+
+Once the image is pushed, deploy the function into the `tenant1` namespace and wire in the `api-key` secret so the function can read it at runtime:
+
+```python
+from openfaas.models import FunctionDeployment
+
+spec = FunctionDeployment(
+    service="greeter",
+    image="ttl.sh/greeter:1h",
+    namespace="tenant1",
+    secrets=["api-key"],
+)
+client.deploy(spec)
+```
+
+### Invoke and verify
+
+With the function running, call it with the API key as a Bearer token to get the `200` response:
+
+```python
+resp = client.invoke_function(
+    "greeter",
+    namespace="tenant1",
+    method="GET",
+    headers={"Authorization": f"Bearer {api_key}"},
+)
+print(resp.status_code, resp.text)
+# 200 {"message": "Hello from OpenFaaS!"}
+```
+
+The complete script — including the ready-poll loop, log streaming, and cleanup — is in [`e2e.py`](https://github.com/welteki/openfaas-python-sdk-example/blob/main/e2e.py) in the example repository.
+
 ## Wrapping up
 
 The [OpenFaaS Python SDK](https://github.com/openfaas/python-sdk) gives you typed, validated access to the OpenFaaS API from Python, including the Function Builder for building and pushing container images from source.
